@@ -1,0 +1,218 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Spark Splat + GLB Viewer (diagnostic)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      html, body { height:100%; margin:0; background:#0d0f14; }
+      #app { width:100%; height:100%; }
+      canvas { display:block; width:100%; height:100%; touch-action:none; }
+      .ui {
+        position:fixed; top:10px; left:10px; right:10px;
+        display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+        background:rgba(0,0,0,.55); color:#fff;
+        padding:8px 10px; border-radius:8px; font:12px/1.2 system-ui;
+      }
+      .ui input[type="text"] { width: 320px; }
+      .ui .status { margin-left:auto; opacity:.9; }
+      .ok { color:#9eff9e; }
+      .fail { color:#ffb3b3; }
+    </style>
+
+    <!-- Import map MUST come before the module script -->
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./spark/three.module.js",
+          "@sparkjsdev/spark": "./spark/spark.module.js",
+          "three/examples/jsm/loaders/GLTFLoader.js": "./three/examples/jsm/loaders/GLTFLoader.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <div class="ui">
+      <strong>Viewer</strong>
+      <label>SPZ URL:
+        <input id="src" type="text" placeholder="./assets/example.spz" />
+      </label>
+      <button id="loadSplatBtn">Load Splat URL</button>
+      <button id="pickSplatBtn">Pick Splat (file)</button>
+      <input id="splatFile" type="file" accept=".spz,.splat,.ksplat,.ply" style="display:none" />
+
+      <button id="pickGlbBtn">Pick Model (.glb)</button>
+      <input id="glbFile" type="file" accept=".glb" style="display:none" />
+
+      <span id="status" class="status"></span>
+    </div>
+
+    <script type="module">
+      const log = (...a) => console.log('[viewer]', ...a);
+      const statusEl = document.getElementById('status');
+      const setStatus = (txt, cls='') => { statusEl.className = 'status ' + cls; statusEl.textContent = txt; };
+
+      // --- Step 1: dynamic-import sanity checks (these MUST succeed and appear in Network) ---
+      setStatus('checking modules…');
+      try {
+        const three = await import('./spark/three.module.js')
+          .then(m => (log('three ok'), m))
+          .catch(e => { throw new Error('three.module.js failed: ' + (e?.message || e)); });
+
+        const spark = await import('./spark/spark.module.js')
+          .then(m => (log('spark ok', Object.keys(m)), m))
+          .catch(e => { throw new Error('spark.module.js failed: ' + (e?.message || e)); });
+
+        const { GLTFLoader } = await import('./three/examples/jsm/loaders/GLTFLoader.js')
+          .then(m => (log('GLTFLoader ok'), m))
+          .catch(e => { throw new Error('GLTFLoader.js failed: ' + (e?.message || e)); });
+
+        setStatus('modules ok', 'ok');
+
+        // --- Step 2: build the scene once modules are confirmed ---
+        const { SparkRenderer, SplatMesh, SparkControls } = spark;
+        const app = document.getElementById('app');
+        const renderer = new three.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+        renderer.outputColorSpace = three.SRGBColorSpace;
+        renderer.setSize(innerWidth, innerHeight);
+        app.appendChild(renderer.domElement);
+
+        const scene = new three.Scene();
+        scene.background = new three.Color(0x0d0f14);
+        const camera = new three.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
+
+        // Lights for GLB
+        scene.add(new three.AmbientLight(0xffffff, 1.0));
+        const dir = new three.DirectionalLight(0xffffff, 1.0); dir.position.set(2,3,4); scene.add(dir);
+
+        const sparkRenderer = new SparkRenderer({ renderer });
+        scene.add(sparkRenderer);
+        const controls = new SparkControls({ canvas: renderer.domElement });
+
+        addEventListener('resize', () => {
+          camera.aspect = innerWidth / innerHeight;
+          camera.updateProjectionMatrix();
+          renderer.setSize(innerWidth, innerHeight);
+        });
+
+        renderer.setAnimationLoop(() => { controls.update(camera); renderer.render(scene, camera); });
+
+        // helpers
+        function frameAll(objs) {
+          const box = new three.Box3();
+          objs.filter(Boolean).forEach(o => box.expandByObject(o));
+          if (box.isEmpty()) return;
+          const size = new three.Vector3(), center = new three.Vector3();
+          box.getSize(size); box.getCenter(center);
+          const maxSize = Math.max(size.x, size.y, size.z) || 1;
+          const dist = maxSize / (2 * Math.tan((Math.PI * camera.fov) / 360));
+          camera.position.set(center.x, center.y, center.z + dist * 1.5);
+        }
+
+        let currentSplat = null, currentModel = null;
+        function clearObject(obj) {
+          if (!obj) return;
+          scene.remove(obj);
+          if (obj.traverse) obj.traverse(o => {
+            if (o.isMesh) {
+              o.geometry?.dispose?.();
+              if (Array.isArray(o.material)) o.material.forEach(m => m?.dispose?.());
+              else o.material?.dispose?.();
+            }
+          });
+        }
+
+        async function loadSplatURL(url) {
+          setStatus('loading splat…');
+          try {
+            clearObject(currentSplat);
+            const s = new SplatMesh({ url });
+            s.quaternion.set(1,0,0,0);
+            scene.add(s);
+            await s.initialized;     // if WASM missing, this never resolves → watch Network for .wasm 404s
+            currentSplat = s;
+            frameAll([currentSplat, currentModel]);
+            setStatus('ready', 'ok');
+          } catch (e) {
+            console.error(e); setStatus('splat failed', 'fail'); alert('Splat load failed: ' + (e?.message||e));
+          }
+        }
+
+        async function loadSplatFile(file) {
+          setStatus('loading splat (file)…');
+          try {
+            clearObject(currentSplat);
+            const bytes = await file.arrayBuffer();
+            const s = new SplatMesh({ fileBytes: bytes });
+            s.quaternion.set(1,0,0,0);
+            scene.add(s);
+            await s.initialized;
+            currentSplat = s;
+            frameAll([currentSplat, currentModel]);
+            setStatus('ready', 'ok');
+          } catch (e) {
+            console.error(e); setStatus('splat failed', 'fail'); alert('Splat load failed: ' + (e?.message||e));
+          }
+        }
+
+        async function loadGlbBytes(bytes) {
+          setStatus('loading model…');
+          try {
+            clearObject(currentModel);
+            const blob = new Blob([bytes], { type: 'model/gltf-binary' });
+            const blobURL = URL.createObjectURL(blob);
+            try {
+              const gltf = await new GLTFLoader().loadAsync(blobURL);
+              const root = gltf.scene || gltf.scenes?.[0];
+              if (!root) throw new Error('GLB had no scene');
+              scene.add(root);
+              currentModel = root;
+              frameAll([currentSplat, currentModel]);
+              setStatus('ready', 'ok');
+            } finally { URL.revokeObjectURL(blobURL); }
+          } catch (e) {
+            console.error(e); setStatus('model failed', 'fail'); alert('Model load failed: ' + (e?.message||e));
+          }
+        }
+
+        async function loadGlbURL(url) {
+          try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            await loadGlbBytes(await res.arrayBuffer());
+          } catch (e) {
+            console.warn('Branding GLB not loaded:', e?.message || e);
+          }
+        }
+
+        // UI
+        const srcInput = document.getElementById('src');
+        const loadSplatBtn = document.getElementById('loadSplatBtn');
+        const pickSplatBtn = document.getElementById('pickSplatBtn');
+        const splatFile = document.getElementById('splatFile');
+        const pickGlbBtn = document.getElementById('pickGlbBtn');
+        const glbFile = document.getElementById('glbFile');
+
+        loadSplatBtn.onclick = () => loadSplatURL((srcInput.value || './assets/example.spz').trim());
+        pickSplatBtn.onclick = () => splatFile.click();
+        splatFile.onchange = () => { const f = splatFile.files?.[0]; if (f) loadSplatFile(f); splatFile.value=''; };
+        pickGlbBtn.onclick = () => glbFile.click();
+        glbFile.onchange = async () => {
+          const f = glbFile.files?.[0]; if (!f) return;
+          if (!f.name.toLowerCase().endsWith('.glb')) { alert('Please choose a .glb'); return; }
+          await loadGlbBytes(await f.arrayBuffer()); glbFile.value='';
+        };
+
+        // --- Step 3: autoload defaults (watch Network for these URLs) ---
+        srcInput.value = './assets/example.spz';
+        await loadSplatURL('./assets/example.spz');  // required
+        await loadGlbURL('./assets/branding.glb');   // optional
+      } catch (err) {
+        console.error(err);
+        setStatus(String(err), 'fail');
+      }
+    </script>
+  </body>
+</html>
